@@ -1,0 +1,7 @@
+{
+  "name": "academy-people",
+  "description": "The Academy community of people",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
