@@ -679,6 +679,7 @@ const App = () => {
   const [sessionCancellations, setSessionCancellations] = useState<SessionCancellation[]>([]);
   const [newCancellation, setNewCancellation] = useState({
     sessionName: '',
+    cancellationDate: getTodayString(),
     reason: '',
     refundIssued: 'No',
     fitsRefundPolicy: 'No',
@@ -964,7 +965,7 @@ const App = () => {
     setSessionsFeedback('');
     setCoachFeedback('');
     setSessionCancellations([]);
-    setNewCancellation({ sessionName: '', reason: '', refundIssued: 'No', fitsRefundPolicy: 'No' });
+    setNewCancellation({ sessionName: '', cancellationDate: getTodayString(), reason: '', refundIssued: 'No', fitsRefundPolicy: 'No' });
     setCommunications([]);
     setNewCommunication({ type: 'Email', subject: '', notes: '' });
     setCoachCommentsLog([]);
@@ -1198,14 +1199,14 @@ const App = () => {
       const newRecord: SessionCancellation = {
           id: crypto.randomUUID(),
           sessionName: newCancellation.sessionName.trim(),
-          cancellationDate: new Date().toISOString(),
+          cancellationDate: new Date(newCancellation.cancellationDate).toISOString(),
           reason: newCancellation.reason.trim(),
           refundIssued: newCancellation.refundIssued === 'Yes',
           fitsRefundPolicy: newCancellation.fitsRefundPolicy === 'Yes',
       };
       
       setSessionCancellations(prev => [...prev, newRecord]);
-      setNewCancellation({ sessionName: '', reason: '', refundIssued: 'No', fitsRefundPolicy: 'No' });
+      setNewCancellation({ sessionName: '', cancellationDate: getTodayString(), reason: '', refundIssued: 'No', fitsRefundPolicy: 'No' });
   };
   
   const handleRemoveCancellation = (idToRemove: string) => {
@@ -2237,6 +2238,10 @@ const App = () => {
                     <div className="form-group">
                         <label htmlFor="cancellation-sessionName">Session Name</label>
                         <input id="cancellation-sessionName" type="text" value={newCancellation.sessionName} onChange={e => setNewCancellation(p => ({...p, sessionName: e.target.value}))} disabled={!canEditField('sessionCancellations')} />
+                    </div>
+                     <div className="form-group">
+                        <label htmlFor="cancellation-date">Cancellation Date</label>
+                        <input id="cancellation-date" type="date" value={newCancellation.cancellationDate} onChange={e => setNewCancellation(p => ({...p, cancellationDate: e.target.value}))} max={getTodayString()} disabled={!canEditField('sessionCancellations')} />
                     </div>
                      <div className="form-group">
                         <label htmlFor="cancellation-reason">Reason for Cancellation</label>
