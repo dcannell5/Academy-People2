@@ -6,6 +6,48 @@
 import React, { useState, useEffect, FormEvent, useRef, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI } from '@google/genai';
+import { initializeApp } from 'firebase/app';
+import { 
+    getFirestore, 
+    collection, 
+    onSnapshot,
+    addDoc,
+    updateDoc,
+    deleteDoc,
+    doc,
+    writeBatch,
+    enableIndexedDbPersistence,
+    Timestamp
+} from 'firebase/firestore';
+
+
+// --- FIREBASE CONFIGURATION ---
+// IMPORTANT: Replace the placeholder values below with your actual Firebase project configuration.
+// You can find this in your Firebase project console:
+// Project Overview -> Project settings (gear icon) -> General tab -> Your apps -> Web app -> SDK setup and configuration
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY", // Replace with your key
+  authDomain: "academy-people.firebaseapp.com",
+  projectId: "academy-people",
+  storageBucket: "academy-people.appspot.com",
+  messagingSenderId: "YOUR_MESSAGING_SENDER_ID", // Replace with your ID
+  appId: "YOUR_APP_ID" // Replace with your ID
+};
+
+// Initialize Firebase and Firestore
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
+// Enable offline persistence
+enableIndexedDbPersistence(db)
+  .catch((err) => {
+    if (err.code == 'failed-precondition') {
+      console.warn('Firestore offline persistence could not be enabled. Multiple tabs open?');
+    } else if (err.code == 'unimplemented') {
+      console.warn('The current browser does not support all of the features required for offline persistence.');
+    }
+  });
+
 
 type MemberStatus = 'Active' | 'Inactive' | 'Pending';
 type UserRole = 'SuperAdmin' | 'AssistAdmin' | 'MediaAdmin' | 'MerchAdmin' | 'FinanceAdmin' | 'Member';
@@ -15,6 +57,7 @@ type CommunicationType = 'Newsletter' | 'Memo' | 'Email' | 'Phone Call';
 const ALL_ROLES: UserRole[] = ['SuperAdmin', 'AssistAdmin', 'MediaAdmin', 'MerchAdmin', 'FinanceAdmin', 'Member'];
 const ALL_MEMBER_TYPES: MemberType[] = ['N/A', 'Player', 'Parent/Guardian', 'Coach', 'Community Member'];
 const ALL_COMMUNICATION_TYPES: CommunicationType[] = ['Email', 'Phone Call', 'Newsletter', 'Memo'];
+const ALL_MEMBER_ROLES = ['Academy Admin', 'Board Members', 'Active Youth Players', 'Post Secondary Players', 'Coaches', 'Referees', 'Player Support Members'];
 
 
 const ACADEMY_LEVELS = {
@@ -157,7 +200,7 @@ interface PhotoLink {
 interface Member {
   id: string; // Now mandatory
   name: string;
-  role: string;
+  role: string[];
   memberType?: MemberType;
   bio: string;
   bioSummary?: string;
@@ -231,227 +274,153 @@ interface FormDraft {
 }
 
 // --- DATA ABSTRACTION LAYER (API CLIENT) ---
-// This object simulates an API client by using localStorage, but maintains an async, promise-based
-// interface, making it easy to swap out for a real backend later.
-
-const MOCK_API_LATENCY = 150; // ms
+// This object now interacts with Firestore instead of localStorage.
 
 const apiClient = {
-    _getData() {
+    // NOTE: User-specific settings like role, searches, and drafts are still in localStorage.
+    // In a full application, these would be tied to an authenticated user account in Firestore.
+    _getLocalData(key: string, defaultValue: any) {
         try {
-            const data = localStorage.getItem('community-app-data-v2');
-            if (data) {
-                const parsed = JSON.parse(data);
-                if (parsed.members && parsed.groups) return parsed;
-            }
+            const data = localStorage.getItem(key);
+            return data ? JSON.parse(data) : defaultValue;
         } catch (e) {
-            console.error("Failed to parse data from localStorage", e);
+            console.error(`Failed to parse ${key} from localStorage`, e);
+            return defaultValue;
         }
-        return { members: [], groups: [], userRole: 'SuperAdmin', recentSearches: [], formDraft: null };
     },
-    _saveData(data: any) {
-        localStorage.setItem('community-app-data-v2', JSON.stringify(data));
+    _saveLocalData(key: string, data: any) {
+        localStorage.setItem(key, JSON.stringify(data));
     },
 
-    async getInitialData(): Promise<{ members: Member[], groups: Group[], userRole: UserRole, recentSearches: string[] }> {
-        return new Promise(resolve => {
-            setTimeout(() => {
-                const data = this._getData();
-                resolve({
-                    members: data.members,
-                    groups: data.groups,
-                    userRole: data.userRole,
-                    recentSearches: data.recentSearches,
-                });
-            }, MOCK_API_LATENCY);
+    // REAL-TIME LISTENERS
+    setupFirestoreListeners(
+        setMembers: React.Dispatch<React.SetStateAction<Member[]>>,
+        setGroups: React.Dispatch<React.SetStateAction<Group[]>>
+    ) {
+        const membersUnsub = onSnapshot(collection(db, "members"), (snapshot) => {
+            const membersData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Member[];
+            setMembers(membersData);
+        }, (error) => {
+            console.error("Error fetching members:", error);
+            alert("Could not fetch members from the database.");
         });
+
+        const groupsUnsub = onSnapshot(collection(db, "groups"), (snapshot) => {
+            const groupsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Group[];
+            setGroups(groupsData);
+        }, (error) => {
+            console.error("Error fetching groups:", error);
+            alert("Could not fetch groups from the database.");
+        });
+
+        // Return a cleanup function to unsubscribe when the component unmounts
+        return () => {
+            membersUnsub();
+            groupsUnsub();
+        };
     },
 
     async createMember(memberData: Omit<Member, 'id'>): Promise<Member> {
-        return new Promise(resolve => {
-            setTimeout(() => {
-                const data = this._getData();
-                const newMember: Member = {
-                    ...memberData,
-                    id: crypto.randomUUID(),
-                    createdAt: new Date().toISOString(),
-                    lastActive: new Date().toISOString(),
-                    activityLog: [{ timestamp: new Date().toISOString(), event: "Member record created." }],
-                } as Member;
-                data.members.push(newMember);
-                this._saveData(data);
-                resolve(newMember);
-            }, MOCK_API_LATENCY);
-        });
+        const newMemberData = {
+            ...memberData,
+            createdAt: Timestamp.now().toDate().toISOString(),
+            lastActive: Timestamp.now().toDate().toISOString(),
+            activityLog: [{ timestamp: Timestamp.now().toDate().toISOString(), event: "Member record created." }],
+        };
+        const docRef = await addDoc(collection(db, 'members'), newMemberData);
+        return { ...newMemberData, id: docRef.id } as Member;
     },
 
     async updateMember(memberId: string, memberData: Member): Promise<Member> {
-        return new Promise((resolve, reject) => {
-            setTimeout(() => {
-                const data = this._getData();
-                const index = data.members.findIndex((m: Member) => m.id === memberId);
-                if (index === -1) {
-                    return reject(new Error("Member not found"));
-                }
-                const updatedMember = {
-                    ...memberData,
-                    lastActive: new Date().toISOString(),
-                    activityLog: [
-                        { timestamp: new Date().toISOString(), event: "Member details updated." },
-                        ...(memberData.activityLog || [])
-                    ]
-                };
-                data.members[index] = updatedMember;
-                this._saveData(data);
-                resolve(updatedMember);
-            }, MOCK_API_LATENCY);
-        });
+        const memberRef = doc(db, 'members', memberId);
+        const updatedMemberData = {
+            ...memberData,
+            lastActive: Timestamp.now().toDate().toISOString(),
+            activityLog: [
+                { timestamp: Timestamp.now().toDate().toISOString(), event: "Member details updated." },
+                ...(memberData.activityLog || [])
+            ]
+        };
+        await updateDoc(memberRef, updatedMemberData);
+        return updatedMemberData;
     },
 
     async deleteMember(memberId: string): Promise<void> {
-        return new Promise(resolve => {
-            setTimeout(() => {
-                const data = this._getData();
-                data.members = data.members.filter((m: Member) => m.id !== memberId);
-                data.members.forEach((m: Member) => {
-                    if (m.relationship?.relatedMemberId === memberId) {
-                        m.relationship = undefined;
-                    }
-                });
-                this._saveData(data);
-                resolve();
-            }, MOCK_API_LATENCY);
-        });
+        // This is a simplified delete. In a real app, you might want to handle relationships
+        // in a more robust way (e.g., using a Firebase Function).
+        await deleteDoc(doc(db, 'members', memberId));
     },
 
     async createGroup(groupData: Omit<Group, 'id'>): Promise<Group> {
-         return new Promise(resolve => {
-            setTimeout(() => {
-                const data = this._getData();
-                const newGroup: Group = { ...groupData, id: crypto.randomUUID() };
-                data.groups.push(newGroup);
-                this._saveData(data);
-                resolve(newGroup);
-            }, MOCK_API_LATENCY);
-        });
+        const docRef = await addDoc(collection(db, 'groups'), groupData);
+        return { ...groupData, id: docRef.id };
     },
     async updateGroup(groupId: string, groupData: Group): Promise<Group> {
-        return new Promise((resolve, reject) => {
-            setTimeout(() => {
-                const data = this._getData();
-                const index = data.groups.findIndex((g: Group) => g.id === groupId);
-                if (index === -1) return reject(new Error("Group not found"));
-                data.groups[index] = groupData;
-                this._saveData(data);
-                resolve(groupData);
-            }, MOCK_API_LATENCY);
-        });
+        const groupRef = doc(db, 'groups', groupId);
+        await updateDoc(groupRef, groupData);
+        return groupData;
     },
     async deleteGroup(groupId: string): Promise<void> {
-        return new Promise(resolve => {
-            setTimeout(() => {
-                const data = this._getData();
-                data.groups = data.groups.filter((g: Group) => g.id !== groupId);
-                data.members.forEach((m: Member) => {
-                    if (m.groupId === groupId) {
-                        m.groupId = undefined;
-                        m.subgroup = undefined;
-                    }
-                });
-                this._saveData(data);
-                resolve();
-            }, MOCK_API_LATENCY);
-        });
+        const groupRef = doc(db, 'groups', groupId);
+        await deleteDoc(groupRef);
+        // Note: This does not automatically unassign members. 
+        // This logic remains on the client-side for now but would be better in a Firebase Function.
     },
 
+    // --- User-specific settings still using localStorage ---
+    async getUserRole(): Promise<UserRole> {
+        return Promise.resolve(this._getLocalData('community-app-role', 'SuperAdmin'));
+    },
     async saveUserRole(role: UserRole): Promise<void> {
-        return new Promise(resolve => {
-            setTimeout(() => {
-                const data = this._getData();
-                data.userRole = role;
-                this._saveData(data);
-                resolve();
-            }, MOCK_API_LATENCY);
-        });
+        this._saveLocalData('community-app-role', role);
+        return Promise.resolve();
+    },
+    async getRecentSearches(): Promise<string[]> {
+        return Promise.resolve(this._getLocalData('community-app-searches', []));
     },
     async saveRecentSearches(searches: string[]): Promise<void> {
-        return new Promise(resolve => {
-            setTimeout(() => {
-                const data = this._getData();
-                data.recentSearches = searches;
-                this._saveData(data);
-                resolve();
-            }, MOCK_API_LATENCY);
-        });
+        this._saveLocalData('community-app-searches', searches);
+        return Promise.resolve();
     },
-
     async getFormDraft(): Promise<FormDraft | null> {
-        return new Promise(resolve => {
-            setTimeout(() => {
-                const data = this._getData();
-                resolve(data.formDraft || null);
-            }, MOCK_API_LATENCY);
-        });
+        return Promise.resolve(this._getLocalData('community-app-draft-v2', null));
     },
     async saveFormDraft(draft: FormDraft): Promise<void> {
-        return new Promise(resolve => {
-            setTimeout(() => {
-                const data = this._getData();
-                data.formDraft = draft;
-                this._saveData(data);
-                resolve();
-            }, MOCK_API_LATENCY);
-        });
+        this._saveLocalData('community-app-draft-v2', draft);
+        return Promise.resolve();
     },
     async clearFormDraft(): Promise<void> {
-        return new Promise(resolve => {
-            setTimeout(() => {
-                const data = this._getData();
-                data.formDraft = null;
-                this._saveData(data);
-                resolve();
-            }, MOCK_API_LATENCY);
-        });
+        localStorage.removeItem('community-app-draft-v2');
+        return Promise.resolve();
     },
     
-    async bulkImport(importData: CsvImportData): Promise<Member[]> {
-        return new Promise(resolve => {
-            setTimeout(() => {
-                const data = this._getData();
-                const memberMap = new Map(data.members.map((m: Member) => [m.email?.toLowerCase(), m.id]));
+    async bulkImport(importData: CsvImportData, members: Member[]): Promise<void> {
+        const batch = writeBatch(db);
+        const memberMap = new Map(members.map((m: Member) => [m.email?.toLowerCase(), m.id]));
 
-                importData.updatedMembers.forEach(update => {
-                    const existingId = memberMap.get(update.original.email?.toLowerCase());
-                    if (existingId) {
-                        const index = data.members.findIndex((m: Member) => m.id === existingId);
-                        const originalMember = data.members[index];
-
-                        const communicationLog = [
-                            { id: crypto.randomUUID(), type: 'Memo' as CommunicationType, date: new Date().toISOString(), subject: 'System Import', notes: 'Member record updated via CSV import.' },
-                            ...(originalMember.communications || [])
-                        ];
-                        const activityLog = [
-                            { timestamp: new Date().toISOString(), event: "Member record updated via CSV import." },
-                            ...(originalMember.activityLog || [])
-                        ];
-                        data.members[index] = { ...update.member, communications: communicationLog, activityLog: activityLog };
-                    }
-                });
-
-                data.members.push(...importData.newMembers);
-                this._saveData(data);
-                resolve(data.members);
-            }, MOCK_API_LATENCY);
+        importData.updatedMembers.forEach(update => {
+            const existingId = memberMap.get(update.original.email?.toLowerCase());
+            if (existingId) {
+                const memberRef = doc(db, 'members', existingId);
+                const communicationLog = [
+                    { id: crypto.randomUUID(), type: 'Memo' as CommunicationType, date: new Date().toISOString(), subject: 'System Import', notes: 'Member record updated via CSV import.' },
+                    ...(update.original.communications || [])
+                ];
+                const activityLog = [
+                    { timestamp: new Date().toISOString(), event: "Member record updated via CSV import." },
+                    ...(update.original.activityLog || [])
+                ];
+                batch.update(memberRef, { ...update.member, communications: communicationLog, activityLog: activityLog });
+            }
         });
+
+        importData.newMembers.forEach(newMember => {
+            const newMemberRef = doc(collection(db, 'members')); // Create a new doc reference
+            batch.set(newMemberRef, newMember);
+        });
+
+        await batch.commit();
     },
-    async clearAllData(): Promise<void> {
-         return new Promise(resolve => {
-            setTimeout(() => {
-                this._saveData({ members: [], groups: [], userRole: 'SuperAdmin', recentSearches: [], formDraft: null });
-                resolve();
-            }, MOCK_API_LATENCY);
-        });
-    }
 };
 
 const generateAvatar = (name: string, id: string): string => {
@@ -636,13 +605,368 @@ const RichTextEditor: React.FC<RichTextEditorProps> = ({ value, onChange, placeh
     );
 };
 
+interface MemberCardProps {
+  member: Member;
+  onSelect: (member: Member) => void;
+  onEdit: (e: React.MouseEvent, member: Member) => void;
+  onDelete: (e: React.MouseEvent, member: Member) => void;
+  hasEditPermission: boolean;
+  hasDeletePermission: boolean;
+  isExiting: boolean;
+}
+
+const MemberCard: React.FC<MemberCardProps> = ({ member, onSelect, onEdit, onDelete, hasEditPermission, hasDeletePermission, isExiting }) => {
+    const handleMapClick = (e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (member.address) {
+            const mapUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(member.address)}`;
+            window.open(mapUrl, '_blank', 'noopener,noreferrer');
+        }
+    };
+
+    const memberRoles = Array.isArray(member.role) ? member.role.join(', ') : member.role;
+
+    return (
+        <div 
+            className={`member-card ${isExiting ? 'exiting' : ''}`}
+            onClick={() => onSelect(member)}
+            onKeyDown={e => {if (e.key === 'Enter' || e.key === ' ') onSelect(member)}}
+            tabIndex={0}
+            role="button"
+            aria-label={`View details for ${member.name}`}
+        >
+          <img 
+            className="member-image" 
+            src={member.imageUrl || generateAvatar(member.name, member.id)} 
+            alt={`Profile picture of ${member.name}`}
+            loading="lazy"
+            onError={(e) => {
+                const target = e.target as HTMLImageElement;
+                if (target.src !== generateAvatar(member.name, member.id)) {
+                    target.src = generateAvatar(member.name, member.id);
+                }
+            }}
+          />
+          <div className="member-card-content">
+            <div className="member-card-header">
+              <h3>{member.name}</h3>
+              <span className={`status-badge status-${member.status.toLowerCase()}`}>{member.status}</span>
+            </div>
+            <p className="role">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+              <span>{memberRoles}</span>
+            </p>
+            {member.affiliations && member.affiliations.length > 0 && (
+                <div className="card-affiliations">
+                    <svg className="affiliation-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L8 12v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
+                     <div className="affiliation-tags-wrapper">
+                        {member.affiliations.map(aff => <span key={aff} className="affiliation-tag-display">{aff}</span>)}
+                    </div>
+                </div>
+            )}
+            {member.bioSummary ? (
+                <p className="member-bio-summary">{member.bioSummary}</p>
+            ) : (
+                <div className="member-bio rich-text-content" dangerouslySetInnerHTML={{ __html: member.bio }}></div>
+            )}
+             <div className="member-card-actions">
+                {hasEditPermission && <button type="button" className="edit-button" onClick={(e) => onEdit(e, member)}>Edit</button>}
+                {hasDeletePermission && <button type="button" className="delete-button" onClick={(e) => onDelete(e, member)}>Delete</button>}
+                {member.address && (
+                    <button type="button" className="map-button" onClick={handleMapClick} title={`View ${member.name}'s address on map`}>
+                        Map
+                    </button>
+                )}
+             </div>
+          </div>
+        </div>
+    );
+};
+
+interface MemberDetailModalProps {
+  member: Member | null;
+  onClose: () => void;
+  onSelectRelatedMember: (member: Member) => void;
+  groupMap: Map<string, Group>;
+  memberMap: Map<string, Member>;
+  isIdCopied: boolean;
+  onCopyId: (id: string) => void;
+}
+
+const MemberDetailModal: React.FC<MemberDetailModalProps> = ({ member, onClose, onSelectRelatedMember, groupMap, memberMap, isIdCopied, onCopyId }) => {
+    if (!member) return null;
+
+    const group = member.groupId ? groupMap.get(member.groupId) : null;
+    const groupPath = [group?.name, member.subgroup].filter(Boolean).join(' / ');
+    const age = calculateAge(member.birthdate);
+    const relatedMember = member.relationship ? memberMap.get(member.relationship.relatedMemberId) : null;
+    const memberRoles = Array.isArray(member.role) ? member.role.join(', ') : member.role;
+
+    return (
+      <div className="member-detail-modal" role="dialog" aria-modal="true" aria-labelledby="member-detail-heading">
+        <div className="member-detail-modal-content">
+          <button type="button" onClick={onClose} className="close-modal-button" aria-label="Close member details">&times;</button>
+          <img 
+            className="member-detail-image" 
+            src={member.imageUrl || generateAvatar(member.name, member.id)} 
+            alt={`Profile picture of ${member.name}`}
+            onError={(e) => {
+                const target = e.target as HTMLImageElement;
+                if (target.src !== generateAvatar(member.name, member.id)) {
+                    target.src = generateAvatar(member.name, member.id);
+                }
+            }}
+          />
+          <h3 id="member-detail-heading">{member.name}</h3>
+          <span className={`status-badge status-${member.status.toLowerCase()}`}>{member.status}</span>
+          <p className="role">
+             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+             <span>{memberRoles}</span>
+          </p>
+          <div className="member-detail-bio rich-text-content" dangerouslySetInnerHTML={{ __html: member.bio }}></div>
+          
+           <div className="member-detail-grid">
+              <div className="detail-section">
+                <h4>Primary Information</h4>
+                <dl>
+                    <dt>Member Type</dt><dd>{member.memberType || 'N/A'}</dd>
+                    <dt>Group</dt><dd>{groupPath || 'Unassigned'}</dd>
+                    <dt>Joined On</dt><dd>{member.dateJoined ? new Date(member.dateJoined).toLocaleDateString() : 'N/A'}</dd>
+                    <dt>Created On</dt><dd>{member.createdAt ? new Date(member.createdAt).toLocaleDateString() : 'N/A'}</dd>
+                    <dt>Last Active</dt><dd>{member.lastActive ? new Date(member.lastActive).toLocaleString() : 'N/A'}</dd>
+                </dl>
+              </div>
+
+               <div className="detail-section">
+                <h4>Contact & Personal</h4>
+                <dl>
+                    <dt>Email</dt><dd>{member.email || 'N/A'}</dd>
+                    <dt>Phone</dt><dd>{member.phone || 'N/A'}</dd>
+                    <dt>Address</dt>
+                    <dd className="address-display">
+                        <span>{member.address || 'N/A'}</span>
+                        {member.address && (
+                            <a 
+                                href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(member.address)}`} 
+                                target="_blank" 
+                                rel="noopener noreferrer"
+                                className="map-link-button"
+                                title="View on Google Maps"
+                                aria-label="View address on Google Maps"
+                            >
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/></svg>
+                            </a>
+                        )}
+                    </dd>
+                    <dt>Birthdate</dt><dd>{member.birthdate ? new Date(member.birthdate).toLocaleDateString() : 'N/A'}</dd>
+                    <dt>Age</dt><dd>{age !== null ? age : 'N/A'}</dd>
+                    <dt>Gender</dt><dd>{member.gender || 'N/A'}</dd>
+                    <dt>Relationship</dt>
+                    <dd className="relationship-display">
+                        {relatedMember ? (
+                            <span>
+                                {member.relationship?.relationshipType}{' '}
+                                <button className="link-button" onClick={() => onSelectRelatedMember(relatedMember)}>{relatedMember.name}</button>
+                            </span>
+                        ) : 'None'}
+                    </dd>
+                    <dt>Member ID</dt>
+                    <dd className="member-id-display">
+                        <span title={member.id}>{member.id.substring(0, 8)}...</span>
+                         <button 
+                            type="button" 
+                            className="copy-id-button" 
+                            onClick={() => onCopyId(member.id)} 
+                            disabled={isIdCopied}
+                            title={isIdCopied ? "Copied!" : "Copy member ID"}
+                            aria-label={isIdCopied ? "Member ID copied to clipboard" : "Copy member ID"}
+                          >
+                            {isIdCopied ? (
+                                <>
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M9 16.2l-3.5-3.5a1 1 0 0 1 1.4-1.4L9 13.4l7.1-7.1a1 1 0 0 1 1.4 1.4L9 16.2z"/></svg>
+                                Copied!
+                                </>
+                            ) : (
+                                <>
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+                                Copy
+                                </>
+                            )}
+                        </button>
+                    </dd>
+                </dl>
+              </div>
+
+               <div className="detail-section full-width">
+                <h4>Education & Volleyball History</h4>
+                 <dl>
+                    <dt>Elementary</dt><dd>{member.elementarySchool || 'N/A'}</dd>
+                    <dt>High School</dt><dd>{member.highSchool || 'N/A'}</dd>
+                    <dt>School Level</dt><dd>{member.schoolVolleyballLevel || 'N/A'}</dd>
+                    <dt>Club</dt><dd>{member.clubVolleyball || 'N/A'}</dd>
+                </dl>
+              </div>
+
+              {member.affiliations && member.affiliations.length > 0 && (
+                <div className="detail-section affiliations-list full-width">
+                    <h4>
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L8 12v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
+                      Affiliations
+                    </h4>
+                    <ul>
+                        {member.affiliations.map(aff => <li key={aff}>{aff}</li>)}
+                    </ul>
+                </div>
+              )}
+
+                <div className="detail-section full-width">
+                    <h4>Academy & Achievements</h4>
+                    {member.academyLevel && member.academyLevel !== 'N/A' && (
+                        <div className="academy-level-details">
+                            <dl>
+                                <dt>{ACADEMY_LEVELS[member.academyLevel].title}</dt>
+                                <dd>{ACADEMY_LEVELS[member.academyLevel].description}</dd>
+                            </dl>
+                        </div>
+                    )}
+                    {member.playerVolleyballAchievements && member.playerVolleyballAchievements.length > 0 && (
+                        <div className="achievements-list">
+                            <h5>Player Achievements</h5>
+                            <ul>{member.playerVolleyballAchievements.map(a => <li key={a}>{a}</li>)}</ul>
+                        </div>
+                    )}
+                    {member.academyAchievements && member.academyAchievements.length > 0 && (
+                        <div className="achievements-list">
+                            <h5>Academy Achievements</h5>
+                            <ul>{member.academyAchievements.map(a => <li key={a}>{a}</li>)}</ul>
+                        </div>
+                    )}
+                     {member.postAcademyAchievements && member.postAcademyAchievements.length > 0 && (
+                        <div className="achievements-list">
+                            <h5>Post-Academy Achievements</h5>
+                            <ul>{member.postAcademyAchievements.map(a => <li key={a}>{a}</li>)}</ul>
+                        </div>
+                    )}
+                    {member.academySessionsAttended && member.academySessionsAttended.length > 0 && (
+                         <div className="achievements-list">
+                            <h5>Sessions Attended</h5>
+                            <ul>{member.academySessionsAttended.map(a => <li key={a}>{a}</li>)}</ul>
+                        </div>
+                    )}
+                    <dl>
+                      <dt>Total Sessions</dt><dd>{member.totalAcademySessions || 'N/A'}</dd>
+                      <dt>Total Hours</dt><dd>{member.academyHours || 'N/A'}</dd>
+                      <dt>Coaches</dt><dd>{member.academyCoaches || 'N/A'}</dd>
+                    </dl>
+                    {member.sessionsFeedback && (
+                        <div className="feedback-block">
+                            <h5>Sessions Feedback</h5>
+                            <p>{member.sessionsFeedback}</p>
+                        </div>
+                    )}
+                    {member.coachFeedback && (
+                         <div className="feedback-block">
+                            <h5>Coach Feedback</h5>
+                            <p>{member.coachFeedback}</p>
+                        </div>
+                    )}
+                </div>
+
+                {member.sessionCancellations && member.sessionCancellations.length > 0 && (
+                    <div className="detail-section full-width">
+                        <h4>Session Cancellations</h4>
+                        <div className="cancellation-detail-list">
+                            {member.sessionCancellations.map(c => (
+                                <div key={c.id} className="cancellation-detail-item">
+                                    <h5>{c.sessionName}</h5>
+                                    <p className="cancellation-reason">{c.reason}</p>
+                                    <div className="cancellation-meta">
+                                        <span><strong>Date:</strong> {new Date(c.cancellationDate).toLocaleDateString(undefined, { timeZone: 'UTC' })}</span>
+                                        <span><strong>Refunded:</strong> {c.refundIssued ? 'Yes' : 'No'}</span>
+                                        <span><strong>Fits Policy:</strong> {c.fitsRefundPolicy ? 'Yes' : 'No'}</span>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
+                
+                <div className="detail-section full-width">
+                    <h4>Communications & Logs</h4>
+                     {member.communications && member.communications.length > 0 && (
+                        <div className="log-display-section">
+                            <h5>Communications Log</h5>
+                            <div className="log-detail-list">
+                                {member.communications.map(c => (
+                                    <div key={c.id} className="log-detail-item">
+                                        <strong>{c.subject} <span className="log-item-meta">({c.type} on {new Date(c.date).toLocaleDateString()})</span></strong>
+                                        <p>{c.notes}</p>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                     )}
+                     {member.coachCommentsLog && member.coachCommentsLog.length > 0 && (
+                         <div className="log-display-section">
+                            <h5>Coach Comments</h5>
+                            <div className="log-detail-list">
+                                {member.coachCommentsLog.map(c => (
+                                    <div key={c.id} className="log-detail-item">
+                                        <p>{c.comment}</p>
+                                        <span className="log-item-meta">Logged on {new Date(c.date).toLocaleString()}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                     )}
+                     {member.photoLinks && member.photoLinks.length > 0 && (
+                        <div className="log-display-section">
+                            <h5>Photo Links</h5>
+                            <div className="log-detail-list">
+                                {member.photoLinks.map(l => (
+                                    <div key={l.id} className="log-detail-item">
+                                        <strong>{l.description}</strong>
+                                        <p><a href={l.url} target="_blank" rel="noopener noreferrer">{l.url}</a></p>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                     )}
+                </div>
+
+          </div>
+
+          <div className="member-detail-activity-log">
+            <h4>Activity Log</h4>
+            <ul>
+              {member.activityLog && member.activityLog.length > 0 ? (
+                member.activityLog.map((log, index) => (
+                    <li key={index}>
+                      <span className="log-timestamp">{new Date(log.timestamp).toLocaleString()}</span>
+                      <p className="log-event">{log.event}</p>
+                    </li>
+                ))
+              ) : (
+                <li>No activity recorded.</li>
+              )}
+            </ul>
+          </div>
+
+        </div>
+      </div>
+    );
+};
+
+
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 const App = () => {
   const [members, setMembers] = useState<Member[]>([]);
+  const [groups, setGroups] = useState<Group[]>([]);
+
   // Form state
   const [name, setName] = useState('');
-  const [role, setRole] = useState('');
+  const [roles, setRoles] = useState<string[]>([]);
   const [memberType, setMemberType] = useState<MemberType>('N/A');
   const [bio, setBio] = useState('');
   const [imageUrl, setImageUrl] = useState('');
@@ -717,6 +1041,7 @@ const App = () => {
   const [memberTypeFilter, setMemberTypeFilter] = useState<MemberType | 'All'>('All');
   const [selectedAffiliations, setSelectedAffiliations] = useState<string[]>([]);
   const [isAffiliationFilterOpen, setIsAffiliationFilterOpen] = useState(false);
+  const [isRoleFilterOpen, setIsRoleFilterOpen] = useState(false);
   const [selectedMember, setSelectedMember] = useState<Member | null>(null);
   const [deletingMemberId, setDeletingMemberId] = useState<string | null>(null);
   const [showExportConfirm, setShowExportConfirm] = useState(false);
@@ -729,7 +1054,6 @@ const App = () => {
 
 
   // Group Management State
-  const [groups, setGroups] = useState<Group[]>([]);
   const [newGroupName, setNewGroupName] = useState('');
   const [newSubgroupName, setNewSubgroupName] = useState('');
   const [editingGroupIdForSubgroup, setEditingGroupIdForSubgroup] = useState('');
@@ -747,6 +1071,7 @@ const App = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const affiliationFilterRef = useRef<HTMLDivElement>(null);
+  const roleFilterRef = useRef<HTMLDivElement>(null);
   const searchContainerRef = useRef<HTMLDivElement>(null);
   const importFileRef = useRef<HTMLInputElement>(null);
   const csvFileRef = useRef<HTMLInputElement>(null);
@@ -773,7 +1098,7 @@ const App = () => {
     
     // Memoize the current form state for auto-saving
     const formState = useMemo(() => ({
-        name, role, memberType, bio, imageUrl, status, affiliations, groupId, subgroup,
+        name, roles, memberType, bio, imageUrl, status, affiliations, groupId, subgroup,
         dateJoined, phone, email, address, birthdate, gender, relationship,
         elementarySchool, highSchool, schoolVolleyballLevel, clubVolleyball,
         academyLevel, playerVolleyballAchievements, academyAchievements, postAcademyAchievements,
@@ -781,7 +1106,7 @@ const App = () => {
         academyCoaches, sessionsFeedback, coachFeedback, sessionCancellations,
         communications, coachCommentsLog, photoLinks
     }), [
-        name, role, memberType, bio, imageUrl, status, affiliations, groupId, subgroup,
+        name, roles, memberType, bio, imageUrl, status, affiliations, groupId, subgroup,
         dateJoined, phone, email, address, birthdate, gender, relationship,
         elementarySchool, highSchool, schoolVolleyballLevel, clubVolleyball,
         academyLevel, playerVolleyballAchievements, academyAchievements, postAcademyAchievements,
@@ -790,27 +1115,33 @@ const App = () => {
         communications, coachCommentsLog, photoLinks
     ]);
 
-    // Load initial data and draft from API client
+    // Load initial data from Firestore and local settings
     useEffect(() => {
-      const loadData = async () => {
-        setIsLoading(true);
-        try {
-            const initialData = await apiClient.getInitialData();
-            setMembers(initialData.members);
-            setGroups(initialData.groups);
-            setCurrentUserRole(initialData.userRole);
-            setRecentSearches(initialData.recentSearches);
-            
-            const draft = await apiClient.getFormDraft();
-            if (draft) setDraftData(draft);
-        } catch (error) {
-            console.error('Failed to load initial data:', error);
-            alert(`Could not load data from the server: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        } finally {
-            setIsLoading(false);
-        }
+      setIsLoading(true);
+
+      // Setup real-time listeners for Firestore data
+      const unsubscribe = apiClient.setupFirestoreListeners(setMembers, setGroups);
+      
+      // Load user-specific settings from local storage
+      const loadLocalData = async () => {
+          try {
+              const role = await apiClient.getUserRole();
+              setCurrentUserRole(role);
+              const searches = await apiClient.getRecentSearches();
+              setRecentSearches(searches);
+              const draft = await apiClient.getFormDraft();
+              if (draft) setDraftData(draft);
+          } catch (error) {
+              console.error('Failed to load local settings:', error);
+          } finally {
+              setIsLoading(false); // Set loading to false after both listeners are attached and local data is loaded
+          }
       };
-      loadData();
+
+      loadLocalData();
+      
+      // Cleanup listeners on component unmount
+      return () => unsubscribe();
     }, []);
 
     // Auto-save form draft on change (debounced)
@@ -819,7 +1150,7 @@ const App = () => {
         if (!hasPermission('canEditMembers') && !hasPermission('canAddMembers')) return;
 
         const handler = setTimeout(async () => {
-            const isPristine = !formState.name && !formState.role && !formState.bio && formState.affiliations.length === 0 && !formState.email;
+            const isPristine = !formState.name && formState.roles.length === 0 && !formState.bio && formState.affiliations.length === 0 && !formState.email;
             if (!isPristine) {
                 const draft: FormDraft = { data: formState, editingId: editingMemberId };
                 try {
@@ -854,6 +1185,7 @@ const App = () => {
         else if (isCameraOpen) closeCamera();
         else if (selectedMember) setSelectedMember(null);
         else if (isAffiliationFilterOpen) setIsAffiliationFilterOpen(false);
+        else if (isRoleFilterOpen) setIsRoleFilterOpen(false);
         else if (isRecentSearchesOpen) setIsRecentSearchesOpen(false);
         else if (showExportConfirm) setShowExportConfirm(false);
         else if (showImportConfirm) {
@@ -868,6 +1200,9 @@ const App = () => {
       if (affiliationFilterRef.current && !affiliationFilterRef.current.contains(event.target as Node)) {
         setIsAffiliationFilterOpen(false);
       }
+      if (roleFilterRef.current && !roleFilterRef.current.contains(event.target as Node)) {
+        setIsRoleFilterOpen(false);
+      }
       if (searchContainerRef.current && !searchContainerRef.current.contains(event.target as Node)) {
         setIsRecentSearchesOpen(false);
       }
@@ -878,7 +1213,7 @@ const App = () => {
       document.removeEventListener('keydown', handleKeyDown);
       document.removeEventListener('mousedown', handleClickOutside);
     };
-  }, [isCameraOpen, selectedMember, isAffiliationFilterOpen, isRecentSearchesOpen, showExportConfirm, showImportConfirm, isDashboardOpen, isRefundPolicyOpen, showCsvImportConfirm]);
+  }, [isCameraOpen, selectedMember, isAffiliationFilterOpen, isRoleFilterOpen, isRecentSearchesOpen, showExportConfirm, showImportConfirm, isDashboardOpen, isRefundPolicyOpen, showCsvImportConfirm]);
 
   const groupMap = useMemo(() => new Map(groups.map(g => [g.id, g])), [groups]);
   const memberMap = useMemo(() => new Map(members.map(m => [m.id, m])), [members]);
@@ -896,7 +1231,7 @@ const App = () => {
       if (!draftData) return;
       const data = draftData.data;
       setName(data.name || '');
-      setRole(data.role || '');
+      setRoles(data.roles || []);
       setMemberType(data.memberType || 'N/A');
       setBio(data.bio || '');
       setImageUrl(data.imageUrl || '');
@@ -935,7 +1270,7 @@ const App = () => {
 
   const resetForm = () => {
     setName('');
-    setRole('');
+    setRoles([]);
     setMemberType('N/A');
     setBio('');
     setImageUrl('');
@@ -985,7 +1320,7 @@ const App = () => {
   const validateForm = (): FormErrors => {
     const newErrors: FormErrors = {};
     if (canEditField('name') && !name.trim()) newErrors.name = 'Full Name is required.';
-    if (canEditField('role') && !role.trim()) newErrors.role = 'Role is required.';
+    if (canEditField('role') && roles.length === 0) newErrors.role = 'At least one role is required.';
 
     const bioText = bio.replace(/<[^>]*>?/gm, '').trim();
     if (canEditField('bio') && !bioText) newErrors.bio = 'Bio is required.';
@@ -1038,6 +1373,8 @@ const App = () => {
         if (!originalMember || bioText !== originalBioText) {
             setIsGeneratingSummary(true);
             try {
+                // IMPORTANT: In a real application, this API call should be made from a secure backend
+                // (like a Firebase Function) to protect your API key.
                 const response = await ai.models.generateContent({
                     model: 'gemini-2.5-flash',
                     contents: `Summarize this community member's bio for a profile card in 20 words or less. Keep it engaging and positive:\n\n"${bioText}"`,
@@ -1061,7 +1398,7 @@ const App = () => {
       : undefined;
 
     const baseMemberData = {
-        name, role, memberType, bio, imageUrl, status, affiliations, groupId, subgroup,
+        name, role: roles, memberType, bio, imageUrl, status, affiliations, groupId, subgroup,
         dateJoined: finalDateJoined,
         phone, email, address, birthdate, gender, relationship: finalRelationship,
         elementarySchool, highSchool, schoolVolleyballLevel, clubVolleyball, academyLevel,
@@ -1083,15 +1420,15 @@ const App = () => {
                 bioSummary: finalBioSummary,
             };
             
-            const updatedMemberFromApi = await apiClient.updateMember(editingMemberId, updatedMemberPayload);
-            setMembers(members.map((m) => m.id === editingMemberId ? updatedMemberFromApi : m));
+            await apiClient.updateMember(editingMemberId, updatedMemberPayload);
+            // No need to manually update state, Firestore listener will do it.
         } else {
             const newMemberPayload = {
                 ...baseMemberData,
                 bioSummary: finalBioSummary,
             };
-            const newMemberFromApi = await apiClient.createMember(newMemberPayload as Omit<Member, 'id'>);
-            setMembers([...members, newMemberFromApi]);
+            await apiClient.createMember(newMemberPayload as Omit<Member, 'id'>);
+            // No need to manually update state, Firestore listener will do it.
         }
         resetForm();
     } catch (error) {
@@ -1107,7 +1444,8 @@ const App = () => {
     if (!hasPermission('canEditMembers')) return;
     
     setName(memberToEdit.name);
-    setRole(memberToEdit.role);
+    // Backward compatibility for when role was a string
+    setRoles(Array.isArray(memberToEdit.role) ? memberToEdit.role : (memberToEdit.role ? [memberToEdit.role] : []));
     setMemberType(memberToEdit.memberType || 'N/A');
     setBio(memberToEdit.bio);
     setImageUrl(memberToEdit.imageUrl || '');
@@ -1153,11 +1491,11 @@ const App = () => {
         
         try {
             await apiClient.deleteMember(memberToDelete.id);
+             // Let animation play, Firestore listener handles state update.
              setTimeout(() => {
-                setMembers(prev => prev.filter(m => m.id !== memberToDelete.id));
                 if (editingMemberId === memberToDelete.id) resetForm();
                 setDeletingMemberId(null);
-            }, 400); // Keep animation
+            }, 400); 
         } catch (error) {
             console.error("Failed to delete member:", error);
             alert(`Error: ${error instanceof Error ? error.message : 'Could not delete member.'}`);
@@ -1299,14 +1637,23 @@ const App = () => {
     );
   };
 
+    const handleRoleChangeInForm = (role: string) => {
+        setRoles(prev =>
+            prev.includes(role)
+                ? prev.filter(r => r !== role)
+                : [...prev, role]
+        );
+        if (errors.role) setErrors(prev => ({ ...prev, role: undefined }));
+    };
+
   const handleAddGroup = async () => {
     if (!hasPermission('canManageGroups')) return;
     const trimmedName = newGroupName.trim();
     if (trimmedName && !groups.some(g => g.name.toLowerCase() === trimmedName.toLowerCase())) {
         try {
             const newGroupData = { name: trimmedName, subgroups: [] };
-            const newGroupFromApi = await apiClient.createGroup(newGroupData);
-            setGroups([...groups, newGroupFromApi]);
+            await apiClient.createGroup(newGroupData);
+            // State will update via Firestore listener
             setNewGroupName('');
         } catch (error) {
             console.error("Failed to add group:", error);
@@ -1320,9 +1667,19 @@ const App = () => {
       const groupName = groupMap.get(groupIdToDelete)?.name || 'this group';
       if (window.confirm(`Are you sure you want to delete the "${groupName}" group and all its subgroups? Members in this group will become unassigned.`)) {
           try {
+              // This is a multi-step operation that should ideally be a transaction or a backend function
+              // For now, we update members on the client *before* deleting the group.
+              const batch = writeBatch(db);
+              members.forEach(m => {
+                  if (m.groupId === groupIdToDelete) {
+                      const memberRef = doc(db, 'members', m.id);
+                      batch.update(memberRef, { groupId: '', subgroup: '' });
+                  }
+              });
+              await batch.commit();
+
               await apiClient.deleteGroup(groupIdToDelete);
-              setGroups(groups.filter(g => g.id !== groupIdToDelete));
-              setMembers(members.map(m => m.groupId === groupIdToDelete ? { ...m, groupId: undefined, subgroup: undefined } : m));
+              // State updates will flow from listeners.
           } catch (error) {
               console.error("Failed to delete group:", error);
               alert(`Error: ${error instanceof Error ? error.message : 'Could not delete group.'}`);
@@ -1345,8 +1702,8 @@ const App = () => {
       const updatedGroup = { ...groupToUpdate, subgroups: [...groupToUpdate.subgroups, trimmedName] };
 
       try {
-          const updatedGroupFromApi = await apiClient.updateGroup(groupId, updatedGroup);
-          setGroups(groups.map(g => g.id === groupId ? updatedGroupFromApi : g));
+          await apiClient.updateGroup(groupId, updatedGroup);
+          // State updates from listener
           setNewSubgroupName('');
           setEditingGroupIdForSubgroup('');
       } catch (error) {
@@ -1364,9 +1721,17 @@ const App = () => {
           const updatedGroup = { ...groupToUpdate, subgroups: groupToUpdate.subgroups.filter(sg => sg !== subgroupToDelete) };
           
           try {
-              const updatedGroupFromApi = await apiClient.updateGroup(groupId, updatedGroup);
-              setGroups(groups.map(g => g.id === groupId ? updatedGroupFromApi : g));
-              setMembers(members.map(m => (m.groupId === groupId && m.subgroup === subgroupToDelete) ? { ...m, subgroup: undefined } : m));
+               const batch = writeBatch(db);
+               members.forEach(m => {
+                   if (m.groupId === groupId && m.subgroup === subgroupToDelete) {
+                       const memberRef = doc(db, 'members', m.id);
+                       batch.update(memberRef, { subgroup: '' });
+                   }
+               });
+               await batch.commit();
+
+              await apiClient.updateGroup(groupId, updatedGroup);
+              // State updates from listener
           } catch (error) {
               console.error("Failed to delete subgroup:", error);
               alert(`Error: ${error instanceof Error ? error.message : 'Could not delete subgroup.'}`);
@@ -1392,8 +1757,8 @@ const App = () => {
     const updatedGroupData = { ...groupToUpdate, name: trimmedName };
 
     try {
-        const updatedGroupFromApi = await apiClient.updateGroup(editingGroupNameId, updatedGroupData);
-        setGroups(groups.map(g => g.id === editingGroupNameId ? updatedGroupFromApi : g));
+        await apiClient.updateGroup(editingGroupNameId, updatedGroupData);
+        // State updates from listener
         setEditingGroupNameId(null);
         setEditingGroupNewName('');
     } catch (error) {
@@ -1426,9 +1791,17 @@ const App = () => {
     };
 
     try {
-        const updatedGroupFromApi = await apiClient.updateGroup(groupId, updatedGroupData);
-        setGroups(groups.map(g => g.id === groupId ? updatedGroupFromApi : g));
-        setMembers(members.map(m => (m.groupId === groupId && m.subgroup === originalName) ? { ...m, subgroup: trimmedName } : m));
+        const batch = writeBatch(db);
+        members.forEach(m => {
+            if (m.groupId === groupId && m.subgroup === originalName) {
+                const memberRef = doc(db, 'members', m.id);
+                batch.update(memberRef, { subgroup: trimmedName });
+            }
+        });
+        await batch.commit();
+
+        await apiClient.updateGroup(groupId, updatedGroupData);
+        // State updates from listener
         setEditingSubgroup(null);
         setEditingSubgroupNewName('');
     } catch (error) {
@@ -1484,7 +1857,7 @@ const App = () => {
 
   const executeImport = async () => {
     if (!importFileData) return;
-    alert("Full JSON import is a high-risk operation. The CSV import is recommended for adding/updating data.");
+    alert("Full JSON import is a high-risk operation that will overwrite all data. The CSV import is recommended for adding/updating data.");
     setShowImportConfirm(false);
     setImportFileData(null);
   };
@@ -1523,7 +1896,7 @@ const App = () => {
             const headers = parseCsvLine(lines[0]).map(h => h.trim());
             const data: CsvImportData = { newMembers: [], updatedMembers: [], errors: [] };
 
-            const listFields = new Set(['affiliations', 'playerVolleyballAchievements', 'academyAchievements', 'postAcademyAchievements', 'academySessionsAttended']);
+            const listFields = new Set(['affiliations', 'playerVolleyballAchievements', 'academyAchievements', 'postAcademyAchievements', 'academySessionsAttended', 'role']);
 
             const groupNameToId = new Map(groups.map(g => [g.name.toLowerCase(), g.id]));
 
@@ -1558,7 +1931,7 @@ const App = () => {
 
                 const importedMember: Partial<Member> = {
                     name: rowData.name,
-                    role: rowData.role || '',
+                    role: rowData.role || [],
                     email: rowData.email || '',
                     status: ['Active', 'Inactive', 'Pending'].includes(rowData.status) ? rowData.status : 'Active',
                     memberType: ALL_MEMBER_TYPES.includes(rowData.memberType) ? rowData.memberType : 'N/A',
@@ -1623,8 +1996,8 @@ const App = () => {
     
     setIsSubmitting(true);
     try {
-        const updatedMembersFromApi = await apiClient.bulkImport(csvImportData);
-        setMembers(updatedMembersFromApi);
+        await apiClient.bulkImport(csvImportData, members);
+        // Data will refresh from Firestore listener
         setShowCsvImportConfirm(false);
         setCsvImportData(null);
         alert(`Import complete! ${csvImportData.newMembers.length} members added, ${csvImportData.updatedMembers.length} members updated.`);
@@ -1740,9 +2113,10 @@ const App = () => {
     .filter(member => {
         const term = searchTerm.toLowerCase();
         if (!term) return true;
+        const memberRoles = Array.isArray(member.role) ? member.role : [member.role];
         return (
           member.name.toLowerCase().includes(term) ||
-          member.role.toLowerCase().includes(term) ||
+          memberRoles.some(r => r.toLowerCase().includes(term)) ||
           member.bio.toLowerCase().includes(term) ||
           (member.affiliations && member.affiliations.some(aff => aff.toLowerCase().includes(term))) ||
           (member.email && member.email.toLowerCase().includes(term)) ||
@@ -1772,6 +2146,11 @@ const App = () => {
             if (key === 'memberType') {
                 aValue = a.memberType || 'N/A';
                 bValue = b.memberType || 'N/A';
+            }
+
+            if (key === 'role') {
+              aValue = Array.isArray(a.role) ? a.role.join(', ') : a.role;
+              bValue = Array.isArray(b.role) ? b.role.join(', ') : b.role;
             }
 
             const valA = (aValue || '').toString();
@@ -1958,20 +2337,56 @@ const App = () => {
                   {errors.name && <p id="name-error" className="error-message">{errors.name}</p>}
                 </div>
                 <div className="form-group">
+                    <label htmlFor="role-filter-toggle">Role</label>
+                    <div ref={roleFilterRef} className="role-filter-container">
+                        <div className="input-wrapper">
+                            <button
+                                type="button"
+                                id="role-filter-toggle"
+                                className={`multiselect-toggle ${errors.role ? 'error' : ''}`}
+                                onClick={() => setIsRoleFilterOpen(prev => !prev)}
+                                aria-haspopup="listbox"
+                                aria-expanded={isRoleFilterOpen}
+                                disabled={!canEditField('role')}
+                            >
+                                <span>{roles.length > 0 ? roles.join(', ') : 'Select one or more roles...'}</span>
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path fillRule="evenodd" d="M1.646 4.646a.5.5 0 0 1 .708 0L8 10.293l5.646-5.647a.5.5 0 0 1 .708.708l-6 6a.5.5 0 0 1-.708 0l-6-6a.5.5 0 0 1 0-.708z"/></svg>
+                            </button>
+                            {errors.role && <div className="error-icon" aria-hidden="true">!</div>}
+                        </div>
+                        {isRoleFilterOpen && (
+                            <div className="multiselect-dropdown" role="listbox">
+                                <ul>
+                                    {ALL_MEMBER_ROLES.map(role => (
+                                        <li key={role}>
+                                            <label>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={roles.includes(role)}
+                                                    onChange={() => handleRoleChangeInForm(role)}
+                                                />
+                                                {role}
+                                            </label>
+                                        </li>
+                                    ))}
+                                </ul>
+                                {roles.length > 0 && (
+                                    <div className="multiselect-actions">
+                                        <button type="button" onClick={() => setRoles([])}>Clear Selection</button>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                    {errors.role && <p id="role-error" className="error-message">{errors.role}</p>}
+                </div>
+                <div className="form-group">
                   <label htmlFor="memberType">Member Type</label>
                   <select id="memberType" value={memberType} onChange={(e) => setMemberType(e.target.value as MemberType)} disabled={!canEditField('memberType')}>
                     {ALL_MEMBER_TYPES.map(type => (
                       <option key={type} value={type}>{type === 'N/A' ? 'Not Applicable' : type.replace(/([A-Z])/g, ' $1').trim()}</option>
                     ))}
                   </select>
-                </div>
-                <div className="form-group">
-                  <label htmlFor="role">Role</label>
-                  <div className="input-wrapper">
-                    <input id="role" type="text" value={role} onChange={(e) => {setRole(e.target.value); if (errors.role) setErrors(prev => ({ ...prev, role: undefined }));}} placeholder="e.g., Software Engineer" required aria-required="true" aria-invalid={!!errors.role} aria-describedby="role-error" className={errors.role ? 'error' : ''} disabled={!canEditField('role')} />
-                    {errors.role && <div className="error-icon" aria-hidden="true">!</div>}
-                  </div>
-                  {errors.role && <p id="role-error" className="error-message">{errors.role}</p>}
                 </div>
                  <div className="form-group">
                   <label htmlFor="status">Status</label>
@@ -2705,7 +3120,7 @@ const App = () => {
                     <div className="members-grid-container">
                         {membersWithoutSubgroup.length > 0 && (
                              <div className="members-grid">
-                                {membersWithoutSubgroup.map(member => <MemberCard key={member.id} member={member} />)}
+                                {membersWithoutSubgroup.map(member => <MemberCard key={member.id} member={member} onSelect={setSelectedMember} onEdit={handleEdit} onDelete={handleDelete} hasEditPermission={hasPermission('canEditMembers')} hasDeletePermission={hasPermission('canDeleteMembers')} isExiting={deletingMemberId === member.id} />)}
                             </div>
                         )}
                         {subgroupsInGroup.map(sg => (
@@ -2713,7 +3128,7 @@ const App = () => {
                                 <h4 className="subgroup-title">{sg}</h4>
                                 <div className="members-grid">
                                     {membersInGroup.filter(m => m.subgroup === sg).map(member => (
-                                        <MemberCard key={member.id} member={member} />
+                                        <MemberCard key={member.id} member={member} onSelect={setSelectedMember} onEdit={handleEdit} onDelete={handleDelete} hasEditPermission={hasPermission('canEditMembers')} hasDeletePermission={hasPermission('canDeleteMembers')} isExiting={deletingMemberId === member.id} />
                                     ))}
                                 </div>
                             </div>
@@ -2731,7 +3146,7 @@ const App = () => {
                 </summary>
                 <div className="members-grid-container">
                     <div className="members-grid">
-                        {unassignedMembers.map(member => <MemberCard key={member.id} member={member} />)}
+                        {unassignedMembers.map(member => <MemberCard key={member.id} member={member} onSelect={setSelectedMember} onEdit={handleEdit} onDelete={handleDelete} hasEditPermission={hasPermission('canEditMembers')} hasDeletePermission={hasPermission('canDeleteMembers')} isExiting={deletingMemberId === member.id} />)}
                     </div>
                 </div>
             </details>
@@ -2754,7 +3169,15 @@ const App = () => {
         </div>
       )}
 
-      {selectedMember && <MemberDetailModal member={selectedMember} />}
+      <MemberDetailModal 
+        member={selectedMember} 
+        onClose={() => setSelectedMember(null)}
+        groupMap={groupMap}
+        memberMap={memberMap}
+        onSelectRelatedMember={setSelectedMember}
+        isIdCopied={isIdCopied}
+        onCopyId={handleCopyId}
+      />
       
       {showExportConfirm && (
         <div className="camera-modal" role="dialog" aria-modal="true" aria-labelledby="export-heading">
@@ -2911,338 +3334,6 @@ const App = () => {
 
     </main>
   );
-
-  function MemberCard({ member }: { member: Member }) {
-    const isExiting = member.id === deletingMemberId;
-
-    const handleMapClick = (e: React.MouseEvent) => {
-        e.stopPropagation();
-        if (member.address) {
-            const mapUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(member.address)}`;
-            window.open(mapUrl, '_blank', 'noopener,noreferrer');
-        }
-    };
-
-    return (
-        <div 
-            className={`member-card ${isExiting ? 'exiting' : ''}`}
-            onClick={() => setSelectedMember(member)}
-            onKeyDown={e => {if (e.key === 'Enter' || e.key === ' ') setSelectedMember(member)}}
-            tabIndex={0}
-            role="button"
-            aria-label={`View details for ${member.name}`}
-        >
-          <img 
-            className="member-image" 
-            src={member.imageUrl || generateAvatar(member.name, member.id)} 
-            alt={`Profile picture of ${member.name}`}
-            loading="lazy"
-            onError={(e) => {
-                const target = e.target as HTMLImageElement;
-                if (target.src !== generateAvatar(member.name, member.id)) {
-                    target.src = generateAvatar(member.name, member.id);
-                }
-            }}
-          />
-          <div className="member-card-content">
-            <div className="member-card-header">
-              <h3>{member.name}</h3>
-              <span className={`status-badge status-${member.status.toLowerCase()}`}>{member.status}</span>
-            </div>
-            <p className="role">
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
-              <span>{member.role}</span>
-            </p>
-            {member.affiliations && member.affiliations.length > 0 && (
-                <div className="card-affiliations">
-                    <svg className="affiliation-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L8 12v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
-                     <div className="affiliation-tags-wrapper">
-                        {member.affiliations.map(aff => <span key={aff} className="affiliation-tag-display">{aff}</span>)}
-                    </div>
-                </div>
-            )}
-            {member.bioSummary ? (
-                <p className="member-bio-summary">{member.bioSummary}</p>
-            ) : (
-                <div className="member-bio rich-text-content" dangerouslySetInnerHTML={{ __html: member.bio }}></div>
-            )}
-             <div className="member-card-actions">
-                {hasPermission('canEditMembers') && <button type="button" className="edit-button" onClick={(e) => handleEdit(e, member)}>Edit</button>}
-                {hasPermission('canDeleteMembers') && <button type="button" className="delete-button" onClick={(e) => handleDelete(e, member)}>Delete</button>}
-                {member.address && (
-                    <button type="button" className="map-button" onClick={handleMapClick} title={`View ${member.name}'s address on map`}>
-                        Map
-                    </button>
-                )}
-             </div>
-          </div>
-        </div>
-    );
-  }
-
-  function MemberDetailModal({ member }: { member: Member | null }) {
-    if (!member) return null;
-
-    const group = member.groupId ? groupMap.get(member.groupId) : null;
-    const groupPath = [group?.name, member.subgroup].filter(Boolean).join(' / ');
-    const age = calculateAge(member.birthdate);
-    const relatedMember = member.relationship ? memberMap.get(member.relationship.relatedMemberId) : null;
-
-    return (
-      <div className="member-detail-modal" role="dialog" aria-modal="true" aria-labelledby="member-detail-heading">
-        <div className="member-detail-modal-content">
-          <button type="button" onClick={() => setSelectedMember(null)} className="close-modal-button" aria-label="Close member details">&times;</button>
-          <img 
-            className="member-detail-image" 
-            src={member.imageUrl || generateAvatar(member.name, member.id)} 
-            alt={`Profile picture of ${member.name}`}
-            onError={(e) => {
-                const target = e.target as HTMLImageElement;
-                if (target.src !== generateAvatar(member.name, member.id)) {
-                    target.src = generateAvatar(member.name, member.id);
-                }
-            }}
-          />
-          <h3 id="member-detail-heading">{member.name}</h3>
-          <span className={`status-badge status-${member.status.toLowerCase()}`}>{member.status}</span>
-          <p className="role">
-             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
-             <span>{member.role}</span>
-          </p>
-          <div className="member-detail-bio rich-text-content" dangerouslySetInnerHTML={{ __html: member.bio }}></div>
-          
-           <div className="member-detail-grid">
-              <div className="detail-section">
-                <h4>Primary Information</h4>
-                <dl>
-                    <dt>Member Type</dt><dd>{member.memberType || 'N/A'}</dd>
-                    <dt>Group</dt><dd>{groupPath || 'Unassigned'}</dd>
-                    <dt>Joined On</dt><dd>{member.dateJoined ? new Date(member.dateJoined).toLocaleDateString() : 'N/A'}</dd>
-                    <dt>Created On</dt><dd>{member.createdAt ? new Date(member.createdAt).toLocaleDateString() : 'N/A'}</dd>
-                    <dt>Last Active</dt><dd>{member.lastActive ? new Date(member.lastActive).toLocaleString() : 'N/A'}</dd>
-                </dl>
-              </div>
-
-               <div className="detail-section">
-                <h4>Contact & Personal</h4>
-                <dl>
-                    <dt>Email</dt><dd>{member.email || 'N/A'}</dd>
-                    <dt>Phone</dt><dd>{member.phone || 'N/A'}</dd>
-                    <dt>Address</dt>
-                    <dd className="address-display">
-                        <span>{member.address || 'N/A'}</span>
-                        {member.address && (
-                            <a 
-                                href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(member.address)}`} 
-                                target="_blank" 
-                                rel="noopener noreferrer"
-                                className="map-link-button"
-                                title="View on Google Maps"
-                                aria-label="View address on Google Maps"
-                            >
-                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/></svg>
-                            </a>
-                        )}
-                    </dd>
-                    <dt>Birthdate</dt><dd>{member.birthdate ? new Date(member.birthdate).toLocaleDateString() : 'N/A'}</dd>
-                    <dt>Age</dt><dd>{age !== null ? age : 'N/A'}</dd>
-                    <dt>Gender</dt><dd>{member.gender || 'N/A'}</dd>
-                    <dt>Relationship</dt>
-                    <dd className="relationship-display">
-                        {relatedMember ? (
-                            <span>
-                                {member.relationship?.relationshipType}{' '}
-                                <button className="link-button" onClick={() => setSelectedMember(relatedMember)}>{relatedMember.name}</button>
-                            </span>
-                        ) : 'None'}
-                    </dd>
-                    <dt>Member ID</dt>
-                    <dd className="member-id-display">
-                        <span title={member.id}>{member.id.substring(0, 8)}...</span>
-                         <button 
-                            type="button" 
-                            className="copy-id-button" 
-                            onClick={() => handleCopyId(member.id)} 
-                            disabled={isIdCopied}
-                            title={isIdCopied ? "Copied!" : "Copy member ID"}
-                            aria-label={isIdCopied ? "Member ID copied to clipboard" : "Copy member ID"}
-                          >
-                            {isIdCopied ? (
-                                <>
-                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M9 16.2l-3.5-3.5a1 1 0 0 1 1.4-1.4L9 13.4l7.1-7.1a1 1 0 0 1 1.4 1.4L9 16.2z"/></svg>
-                                Copied!
-                                </>
-                            ) : (
-                                <>
-                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
-                                Copy
-                                </>
-                            )}
-                        </button>
-                    </dd>
-                </dl>
-              </div>
-
-               <div className="detail-section full-width">
-                <h4>Education & Volleyball History</h4>
-                 <dl>
-                    <dt>Elementary</dt><dd>{member.elementarySchool || 'N/A'}</dd>
-                    <dt>High School</dt><dd>{member.highSchool || 'N/A'}</dd>
-                    <dt>School Level</dt><dd>{member.schoolVolleyballLevel || 'N/A'}</dd>
-                    <dt>Club</dt><dd>{member.clubVolleyball || 'N/A'}</dd>
-                </dl>
-              </div>
-
-              {member.affiliations && member.affiliations.length > 0 && (
-                <div className="detail-section affiliations-list full-width">
-                    <h4>
-                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L8 12v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
-                      Affiliations
-                    </h4>
-                    <ul>
-                        {member.affiliations.map(aff => <li key={aff}>{aff}</li>)}
-                    </ul>
-                </div>
-              )}
-
-                <div className="detail-section full-width">
-                    <h4>Academy & Achievements</h4>
-                    {member.academyLevel && member.academyLevel !== 'N/A' && (
-                        <div className="academy-level-details">
-                            <dl>
-                                <dt>{ACADEMY_LEVELS[member.academyLevel].title}</dt>
-                                <dd>{ACADEMY_LEVELS[member.academyLevel].description}</dd>
-                            </dl>
-                        </div>
-                    )}
-                    {member.playerVolleyballAchievements && member.playerVolleyballAchievements.length > 0 && (
-                        <div className="achievements-list">
-                            <h5>Player Achievements</h5>
-                            <ul>{member.playerVolleyballAchievements.map(a => <li key={a}>{a}</li>)}</ul>
-                        </div>
-                    )}
-                    {member.academyAchievements && member.academyAchievements.length > 0 && (
-                        <div className="achievements-list">
-                            <h5>Academy Achievements</h5>
-                            <ul>{member.academyAchievements.map(a => <li key={a}>{a}</li>)}</ul>
-                        </div>
-                    )}
-                     {member.postAcademyAchievements && member.postAcademyAchievements.length > 0 && (
-                        <div className="achievements-list">
-                            <h5>Post-Academy Achievements</h5>
-                            <ul>{member.postAcademyAchievements.map(a => <li key={a}>{a}</li>)}</ul>
-                        </div>
-                    )}
-                    {member.academySessionsAttended && member.academySessionsAttended.length > 0 && (
-                         <div className="achievements-list">
-                            <h5>Sessions Attended</h5>
-                            <ul>{member.academySessionsAttended.map(a => <li key={a}>{a}</li>)}</ul>
-                        </div>
-                    )}
-                    <dl>
-                      <dt>Total Sessions</dt><dd>{member.totalAcademySessions || 'N/A'}</dd>
-                      <dt>Total Hours</dt><dd>{member.academyHours || 'N/A'}</dd>
-                      <dt>Coaches</dt><dd>{member.academyCoaches || 'N/A'}</dd>
-                    </dl>
-                    {member.sessionsFeedback && (
-                        <div className="feedback-block">
-                            <h5>Sessions Feedback</h5>
-                            <p>{member.sessionsFeedback}</p>
-                        </div>
-                    )}
-                    {member.coachFeedback && (
-                         <div className="feedback-block">
-                            <h5>Coach Feedback</h5>
-                            <p>{member.coachFeedback}</p>
-                        </div>
-                    )}
-                </div>
-
-                {member.sessionCancellations && member.sessionCancellations.length > 0 && (
-                    <div className="detail-section full-width">
-                        <h4>Session Cancellations</h4>
-                        <div className="cancellation-detail-list">
-                            {member.sessionCancellations.map(c => (
-                                <div key={c.id} className="cancellation-detail-item">
-                                    <h5>{c.sessionName}</h5>
-                                    <p className="cancellation-reason">{c.reason}</p>
-                                    <div className="cancellation-meta">
-                                        <span><strong>Date:</strong> {new Date(c.cancellationDate).toLocaleDateString(undefined, { timeZone: 'UTC' })}</span>
-                                        <span><strong>Refunded:</strong> {c.refundIssued ? 'Yes' : 'No'}</span>
-                                        <span><strong>Fits Policy:</strong> {c.fitsRefundPolicy ? 'Yes' : 'No'}</span>
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-                )}
-                
-                <div className="detail-section full-width">
-                    <h4>Communications & Logs</h4>
-                     {member.communications && member.communications.length > 0 && (
-                        <div className="log-display-section">
-                            <h5>Communications Log</h5>
-                            <div className="log-detail-list">
-                                {member.communications.map(c => (
-                                    <div key={c.id} className="log-detail-item">
-                                        <strong>{c.subject} <span className="log-item-meta">({c.type} on {new Date(c.date).toLocaleDateString()})</span></strong>
-                                        <p>{c.notes}</p>
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-                     )}
-                     {member.coachCommentsLog && member.coachCommentsLog.length > 0 && (
-                         <div className="log-display-section">
-                            <h5>Coach Comments</h5>
-                            <div className="log-detail-list">
-                                {member.coachCommentsLog.map(c => (
-                                    <div key={c.id} className="log-detail-item">
-                                        <p>{c.comment}</p>
-                                        <span className="log-item-meta">Logged on {new Date(c.date).toLocaleString()}</span>
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-                     )}
-                     {member.photoLinks && member.photoLinks.length > 0 && (
-                        <div className="log-display-section">
-                            <h5>Photo Links</h5>
-                            <div className="log-detail-list">
-                                {member.photoLinks.map(l => (
-                                    <div key={l.id} className="log-detail-item">
-                                        <strong>{l.description}</strong>
-                                        <p><a href={l.url} target="_blank" rel="noopener noreferrer">{l.url}</a></p>
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-                     )}
-                </div>
-
-          </div>
-
-          <div className="member-detail-activity-log">
-            <h4>Activity Log</h4>
-            <ul>
-              {member.activityLog && member.activityLog.length > 0 ? (
-                member.activityLog.map((log, index) => (
-                    <li key={index}>
-                      <span className="log-timestamp">{new Date(log.timestamp).toLocaleString()}</span>
-                      <p className="log-event">{log.event}</p>
-                    </li>
-                ))
-              ) : (
-                <li>No activity recorded.</li>
-              )}
-            </ul>
-          </div>
-
-        </div>
-      </div>
-    );
-  }
-
 };
 
 const root = createRoot(document.getElementById('root')!);
