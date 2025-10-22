@@ -5,6 +5,7 @@
 
 import React, { useState, useEffect, FormEvent, useRef, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
+import { GoogleGenAI } from '@google/genai';
 
 type MemberStatus = 'Active' | 'Inactive' | 'Pending';
 type UserRole = 'SuperAdmin' | 'AssistAdmin' | 'MediaAdmin' | 'MerchAdmin' | 'FinanceAdmin' | 'Member';
@@ -18,11 +19,12 @@ const ALL_COMMUNICATION_TYPES: CommunicationType[] = ['Email', 'Phone Call', 'Ne
 
 const ACADEMY_LEVELS = {
   'N/A': { title: 'Not Applicable', description: 'No academy level assigned.' },
-  'Rising Star': { title: 'Rising Stars (Grades 3–6, Beginners)', description: 'For younger athletes new to volleyball. Focus: Learning movement patterns and basic coordination to prepare for the next level.' },
-  'NexGen': { title: 'NexGen (Grades 6-8, Beginners)', description: 'Who is it for? Athletes in Grades 6-8 who have attended fewer than five academy sessions and are new to volleyball. Focus: Introducing the fundamentals of volleyball, such as basic skills and game understanding.' },
-  'Basic': { title: 'Basic (Grades 6–10, Beginners with Some Experience)', description: 'For athletes who have at least one year of organized volleyball, OR have completed 5+ NexGen sessions, OR have attended one four-day Academy camp. Focus: Developing skills with more repetition and applying them to game-like situations.' },
-  'Intermediate': { title: 'Intermediate Level', description: 'Target Audience: Players typically grades 9-10 with "a bit more under their belt," often "club experience," or having "attended basic sessions before as a prerequisite or recommendation." Assumed Fundamentals: This level "assumes you\'ve got a pretty solid handle on those fundamentals already." The focus "shifts...into like intermediate skill refinement gameplay strategy."' },
-  'Advanced': { title: 'Advanced (Grades 10-12, Competitive Players)', description: 'Who is it for? Athletes in Grades 10-12 with: 2+ years of high school and/or club volleyball experience, Completion of 10+ academy sessions at lower tiers. Athletes with less than two years of playing experience are not advised to register for this session. Focus: Advanced skills, high-level competition, and preparation for elite performance.' }
+  'Rising Star': { title: 'Rising Star Level (Grades 3-6, No Volleyball training)', description: 'For younger athletes new to volleyball. Focus: Learning movement patterns and basic coordination to prepare for the next level.' },
+  'NexGen': { title: 'NexGen Level (Grades 6-8 Beginner)', description: 'Who is it for? Athletes in Grades 6-8 who have attended fewer than five academy sessions and are new to volleyball. Focus: Introducing the fundamentals of volleyball, such as basic skills and game understanding.' },
+  'Basic': { title: 'Basic Level (Grades 6-9, Beginner with Some Experience)', description: 'For athletes who have at least one year of organized volleyball, OR have completed 5+ NexGen sessions, OR have attended one four-day Academy camp. Focus: Developing skills with more repetition and applying them to game-like situations.' },
+  'Intermediate': { title: 'Intermediate Level (Grades 9-10, Junior High School Player)', description: 'Target Audience: Players typically grades 9-10 with "a bit more under their belt," often "club experience," or having "attended basic sessions before as a prerequisite or recommendation." Assumed Fundamentals: This level "assumes you\'ve got a pretty solid handle on those fundamentals already." The focus "shifts...into like intermediate skill refinement gameplay strategy."' },
+  'Advanced': { title: 'Advanced Level (Grades 10-12, Senior High School Player)', description: 'Who is it for? Athletes in Grades 10-12 with: 2+ years of high school and/or club volleyball experience, Completion of 10+ academy sessions at lower tiers. Athletes with less than two years of playing experience are not advised to register for this session. Focus: Advanced skills, high-level competition, and preparation for elite performance.' },
+  'Elite 1 Restricted': { title: 'Elite 1 Restricted Level (Age 15+, Top Players, Evaluated and Awarded Level)', description: 'For top-tier athletes aged 15 and over who have been evaluated and specifically placed at this level.' }
 };
 
 type AcademyLevel = keyof typeof ACADEMY_LEVELS;
@@ -158,6 +160,7 @@ interface Member {
   role: string;
   memberType?: MemberType;
   bio: string;
+  bioSummary?: string;
   imageUrl?: string;
   status: MemberStatus;
   affiliations: string[];
@@ -633,6 +636,7 @@ const RichTextEditor: React.FC<RichTextEditorProps> = ({ value, onChange, placeh
     );
 };
 
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 const App = () => {
   const [members, setMembers] = useState<Member[]>([]);
@@ -699,6 +703,7 @@ const App = () => {
 
   // UI State
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [stream, setStream] = useState<MediaStream | null>(null);
@@ -1023,6 +1028,32 @@ const App = () => {
     
     setIsSubmitting(true);
 
+    const bioText = bio.replace(/<[^>]*>?/gm, '').trim();
+    let finalBioSummary = '';
+    const originalMember = editingMemberId ? memberMap.get(editingMemberId) : null;
+
+    if (bioText) {
+        const originalBioText = originalMember ? (originalMember.bio || '').replace(/<[^>]*>?/gm, '').trim() : '';
+
+        if (!originalMember || bioText !== originalBioText) {
+            setIsGeneratingSummary(true);
+            try {
+                const response = await ai.models.generateContent({
+                    model: 'gemini-2.5-flash',
+                    contents: `Summarize this community member's bio for a profile card in 20 words or less. Keep it engaging and positive:\n\n"${bioText}"`,
+                });
+                finalBioSummary = response.text;
+            } catch (error) {
+                console.error("AI summary generation failed:", error);
+                alert("There was an issue generating the AI summary. The bio will be saved without a summary.");
+            } finally {
+                setIsGeneratingSummary(false);
+            }
+        } else {
+            finalBioSummary = originalMember?.bioSummary || '';
+        }
+    }
+
     const finalDateJoined = dateJoined ? new Date(dateJoined).toISOString() : new Date().toISOString();
     
     const finalRelationship = relationship.relatedMemberId && relationship.relationshipType
@@ -1044,18 +1075,22 @@ const App = () => {
 
     try {
         if (editingMemberId) {
-            const originalMember = memberMap.get(editingMemberId);
             if (!originalMember) throw new Error("Member to edit not found");
 
             const updatedMemberPayload = {
                 ...originalMember,
-                ...baseMemberData
+                ...baseMemberData,
+                bioSummary: finalBioSummary,
             };
             
             const updatedMemberFromApi = await apiClient.updateMember(editingMemberId, updatedMemberPayload);
             setMembers(members.map((m) => m.id === editingMemberId ? updatedMemberFromApi : m));
         } else {
-            const newMemberFromApi = await apiClient.createMember(baseMemberData as Omit<Member, 'id'>);
+            const newMemberPayload = {
+                ...baseMemberData,
+                bioSummary: finalBioSummary,
+            };
+            const newMemberFromApi = await apiClient.createMember(newMemberPayload as Omit<Member, 'id'>);
             setMembers([...members, newMemberFromApi]);
         }
         resetForm();
@@ -1174,7 +1209,7 @@ const App = () => {
         context?.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
         const dataUrl = canvas.toDataURL('image/jpeg');
         setImageUrl(dataUrl);
-        if (errors.imageUrl) setErrors(prev => ({ ...prev, imageUrl: undefined }));
+        if (errors.imageUrl) setErrors(prev => ({...prev, imageUrl: undefined}));
         closeCamera();
     }
   };
@@ -1813,12 +1848,22 @@ const App = () => {
         maxGroupCount = groupCounts[groupName];
       }
     });
+    
+    const academyHoursLeaderboard = members
+      .filter(m => typeof m.academyHours === 'number' && m.academyHours > 0)
+      .sort((a, b) => (b.academyHours ?? 0) - (a.academyHours ?? 0))
+      .slice(0, 10)
+      .map(m => ({ name: m.name, hours: m.academyHours ?? 0 }));
+      
+    const maxAcademyHours = academyHoursLeaderboard.length > 0 ? academyHoursLeaderboard[0].hours : 0;
 
     return {
       totalMembers: members.length,
       statusCounts,
       groupCounts,
       maxGroupCount,
+      academyHoursLeaderboard,
+      maxAcademyHours,
     };
   }, [members, groups, groupMap]);
   
@@ -1999,7 +2044,7 @@ const App = () => {
                                 if (textContent) setErrors(prev => ({ ...prev, bio: undefined }));
                             }
                         }}
-                        placeholder="Share a bit about this member..."
+                        placeholder="Share a bit about this member... An AI summary will be generated for the member card."
                         error={!!errors.bio}
                         disabled={!canEditField('bio')}
                     />
@@ -2270,6 +2315,7 @@ const App = () => {
                                  <div className="cancellation-item-content">
                                      <strong>{c.sessionName}</strong>
                                      <p><em>Reason:</em> {c.reason}</p>
+                                     <span><strong>Date:</strong> {new Date(c.cancellationDate).toLocaleDateString(undefined, { timeZone: 'UTC' })}</span>
                                      <span><strong>Refunded:</strong> {c.refundIssued ? 'Yes' : 'No'}</span>
                                      <span><strong>Fits Policy:</strong> {c.fitsRefundPolicy ? 'Yes' : 'No'}</span>
                                  </div>
@@ -2377,7 +2423,9 @@ const App = () => {
             </fieldset>
 
             <div className="form-controls">
-              <button type="submit" disabled={isSubmitting}>{isSubmitting ? 'Saving...' : (editingMemberId ? 'Save Changes' : 'Add Member')}</button>
+              <button type="submit" disabled={isSubmitting || isGeneratingSummary}>
+                {isGeneratingSummary ? 'Generating Summary...' : (isSubmitting ? 'Saving...' : (editingMemberId ? 'Save Changes' : 'Add Member'))}
+              </button>
               {editingMemberId && <button type="button" className="cancel-button" onClick={resetForm} disabled={isSubmitting}>Cancel Edit</button>}
               {draftData && <button type="button" className="clear-draft-button" onClick={() => { resetForm(); clearDraft(); }} disabled={isSubmitting}>Clear Form & Draft</button>}
             </div>
@@ -2805,6 +2853,25 @@ const App = () => {
                             ))}
                           </div>
                       </div>
+                      {dashboardStats.academyHoursLeaderboard.length > 0 && (
+                        <div className="dashboard-widget full-width">
+                            <h3>Academy Hours Leaderboard (Top 10)</h3>
+                            <div className="academy-hours-chart">
+                                {dashboardStats.academyHoursLeaderboard.map((member, index) => (
+                                    <div key={index} className="academy-hours-bar-item">
+                                        <span className="academy-hours-bar-label" title={member.name}>{member.name}</span>
+                                        <div className="academy-hours-bar-wrapper">
+                                            <div 
+                                                className="academy-hours-bar" 
+                                                style={{ width: `${dashboardStats.maxAcademyHours > 0 ? (member.hours / dashboardStats.maxAcademyHours) * 100 : 0}%` }}
+                                            ></div>
+                                        </div>
+                                        <span className="academy-hours-bar-count">{member.hours} hrs</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                      )}
                   </div>
               </div>
           </div>
@@ -2847,6 +2914,15 @@ const App = () => {
 
   function MemberCard({ member }: { member: Member }) {
     const isExiting = member.id === deletingMemberId;
+
+    const handleMapClick = (e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (member.address) {
+            const mapUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(member.address)}`;
+            window.open(mapUrl, '_blank', 'noopener,noreferrer');
+        }
+    };
+
     return (
         <div 
             className={`member-card ${isExiting ? 'exiting' : ''}`}
@@ -2885,10 +2961,19 @@ const App = () => {
                     </div>
                 </div>
             )}
-            <div className="member-bio rich-text-content" dangerouslySetInnerHTML={{ __html: member.bio }}></div>
+            {member.bioSummary ? (
+                <p className="member-bio-summary">{member.bioSummary}</p>
+            ) : (
+                <div className="member-bio rich-text-content" dangerouslySetInnerHTML={{ __html: member.bio }}></div>
+            )}
              <div className="member-card-actions">
                 {hasPermission('canEditMembers') && <button type="button" className="edit-button" onClick={(e) => handleEdit(e, member)}>Edit</button>}
                 {hasPermission('canDeleteMembers') && <button type="button" className="delete-button" onClick={(e) => handleDelete(e, member)}>Delete</button>}
+                {member.address && (
+                    <button type="button" className="map-button" onClick={handleMapClick} title={`View ${member.name}'s address on map`}>
+                        Map
+                    </button>
+                )}
              </div>
           </div>
         </div>
@@ -2943,7 +3028,22 @@ const App = () => {
                 <dl>
                     <dt>Email</dt><dd>{member.email || 'N/A'}</dd>
                     <dt>Phone</dt><dd>{member.phone || 'N/A'}</dd>
-                    <dt>Address</dt><dd>{member.address || 'N/A'}</dd>
+                    <dt>Address</dt>
+                    <dd className="address-display">
+                        <span>{member.address || 'N/A'}</span>
+                        {member.address && (
+                            <a 
+                                href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(member.address)}`} 
+                                target="_blank" 
+                                rel="noopener noreferrer"
+                                className="map-link-button"
+                                title="View on Google Maps"
+                                aria-label="View address on Google Maps"
+                            >
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/></svg>
+                            </a>
+                        )}
+                    </dd>
                     <dt>Birthdate</dt><dd>{member.birthdate ? new Date(member.birthdate).toLocaleDateString() : 'N/A'}</dd>
                     <dt>Age</dt><dd>{age !== null ? age : 'N/A'}</dd>
                     <dt>Gender</dt><dd>{member.gender || 'N/A'}</dd>
@@ -2959,7 +3059,14 @@ const App = () => {
                     <dt>Member ID</dt>
                     <dd className="member-id-display">
                         <span title={member.id}>{member.id.substring(0, 8)}...</span>
-                         <button type="button" className="copy-id-button" onClick={() => handleCopyId(member.id)} disabled={isIdCopied}>
+                         <button 
+                            type="button" 
+                            className="copy-id-button" 
+                            onClick={() => handleCopyId(member.id)} 
+                            disabled={isIdCopied}
+                            title={isIdCopied ? "Copied!" : "Copy member ID"}
+                            aria-label={isIdCopied ? "Member ID copied to clipboard" : "Copy member ID"}
+                          >
                             {isIdCopied ? (
                                 <>
                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M9 16.2l-3.5-3.5a1 1 0 0 1 1.4-1.4L9 13.4l7.1-7.1a1 1 0 0 1 1.4 1.4L9 16.2z"/></svg>
@@ -3060,7 +3167,7 @@ const App = () => {
                                     <h5>{c.sessionName}</h5>
                                     <p className="cancellation-reason">{c.reason}</p>
                                     <div className="cancellation-meta">
-                                        <span><strong>Date:</strong> {new Date(c.cancellationDate).toLocaleDateString()}</span>
+                                        <span><strong>Date:</strong> {new Date(c.cancellationDate).toLocaleDateString(undefined, { timeZone: 'UTC' })}</span>
                                         <span><strong>Refunded:</strong> {c.refundIssued ? 'Yes' : 'No'}</span>
                                         <span><strong>Fits Policy:</strong> {c.fitsRefundPolicy ? 'Yes' : 'No'}</span>
                                     </div>

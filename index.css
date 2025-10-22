@@ -595,6 +595,22 @@ button[disabled]:hover {
   -webkit-box-orient: vertical;
 }
 
+.member-bio-summary {
+  color: #555;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  margin-bottom: 1rem;
+  flex-grow: 1;
+  font-style: italic;
+
+  /* Truncate text to 3 lines */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+
 .member-card-actions {
   display: flex;
   gap: 0.5rem;
@@ -627,6 +643,14 @@ button[disabled]:hover {
 
 .delete-button:hover {
     background-color: #c9302c;
+}
+
+.map-button {
+    background-color: #5bc0de;
+}
+
+.map-button:hover {
+    background-color: #31b0d5;
 }
 
 .image-input-group {
@@ -1070,6 +1094,40 @@ button[disabled]:hover {
 
 .detail-section p {
     margin: 0;
+}
+
+.address-display {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.address-display span {
+    flex-grow: 1;
+}
+
+.map-link-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background-color: #fff;
+    color: var(--primary-color);
+    transition: background-color 0.2s;
+    flex-shrink: 0;
+    border: 1px solid #ddd;
+}
+
+.map-link-button:hover {
+    background-color: #e9ecef;
+}
+
+.map-link-button svg {
+    width: 18px;
+    height: 18px;
 }
 
 .relationship-display .link-button {
